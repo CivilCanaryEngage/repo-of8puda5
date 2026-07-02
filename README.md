@@ -39,6 +39,16 @@ python3 main_force.py --kind region
 输出字段：板块、涨幅、成交额、主力资金、散户资金、主力暗盘、主力强度、主力行为（按主力强度降序）。
 报告保存为 `output/日期_类型.csv` 与 `output/日期_类型.html`。
 
+## 桌面客户端 (Windows)
+
+`gui.py` 提供图形界面（Tkinter，标准库自带）：板块类型切换、行为筛选、点击表头排序、手动刷新、每日 15:30 自动刷新、导出 CSV。
+
+```bash
+python3 gui.py
+```
+
+Windows exe 由 GitHub Actions 自动打包（PyInstaller）：在仓库 Actions 页面的 "Build Windows Client" 工作流中下载 `A股主力行为-windows` 构件，解压后双击 exe 即可运行，无需安装 Python。
+
 ## 每日收盘后自动运行
 
 A股收盘为北京时间 15:00，建议 15:30 运行。crontab 示例（服务器为北京时间）：
