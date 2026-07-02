@@ -10,11 +10,12 @@
 公式:
     主力暗盘 = 主力资金 - 散户资金
     主力强度 = 主力暗盘 / 成交额 * 100
-主力行为(按主力强度划分):
-    >= 3        抢筹
-    [1, 3)      建仓
-    (-1, 1)     洗盘
-    <= -1       出货
+主力行为(多日复合判别: 资金方向 × 价格表现 × 散户方向):
+    抢筹: 当日强力流入且放量上攻 (强度>=3 且 涨幅>0)
+    出货: 主力撤离且散户接盘或多日持续流出 (强度<=-1 且 (散户流入 或 5日占比<=-1))
+    建仓: 多日持续吸筹且当日未明显流出 (5日主力净占比>=1 且 强度>-1)
+    洗盘: 资金平衡+回调+散户离场 (|强度|<1 且 涨幅<=0 且 散户流出)
+    其余按单日强度兜底: >=3 抢筹 / [1,3) 建仓 / (-1,1) 洗盘 / <=-1 出货
 """
 
 import argparse
@@ -29,7 +30,7 @@ import urllib.request
 API = (
     "https://push2delay.eastmoney.com/api/qt/clist/get"
     "?pn={page}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f62&fs={fs}"
-    "&fields=f12,f13,f14,f3,f6,f62,f66,f72,f78,f84"
+    "&fields=f12,f13,f14,f3,f6,f62,f66,f72,f78,f84,f109,f164,f165"
 )
 
 # 固定置顶的大盘指数: 上证指数 / 创业板指 / 科创50
@@ -38,7 +39,7 @@ INDEX_SECIDS = "1.000001,0.399006,1.000688"
 INDEX_API = (
     "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
     "?fltt=2&invt=2&secids={secids}"
-    "&fields=f12,f13,f14,f3,f6,f62,f66,f72,f78,f84"
+    "&fields=f12,f13,f14,f3,f6,f62,f66,f72,f78,f84,f109,f164,f165"
 )
 
 # fs 参数: 行业板块 m:90+t:2, 概念板块 m:90+t:3, 地域板块 m:90+t:1
@@ -112,24 +113,24 @@ def search_security(query: str):
 def fetch_history(secid: str, days: int = 14):
     """获取近 N 个交易日的资金流历史, secid 如 90.BK0478 / 1.600519。
 
-    返回按日期降序的字典列表, 字段同 COLUMNS(首列为日期)。
+    返回按日期降序的字典列表, 字段同 HIST_COLUMNS。
+    为了计算每日的"5日主力占比", 实际多拉取 4 日作为滚动窗口。
     """
     fflow = None
     for host in HIST_FFLOW_HOSTS:
         try:
             fflow = _get_json(
-                HIST_FFLOW_API.format(host=host, secid=secid, days=days),
+                HIST_FFLOW_API.format(host=host, secid=secid, days=days + 4),
                 retries=2)
             break
         except Exception:
             if host == HIST_FFLOW_HOSTS[-1]:
                 raise
-    result = []
+    daily = []
     for line in ((fflow.get("data") or {}).get("klines")) or []:
         # f51日期, f52主力, f53小单, f54中单, f55大单, f56超大单,
         # f57~f61对应各类单净占比(%), f62收盘价, f63涨跌幅(%)
         p = line.split(",")
-        date, pct_s = p[0], p[12]
         main = float(p[1])
         retail = float(p[2])  # 散户资金(仅小单)
         # 接口不直接返回成交额, 由 净额/净占比×100 反推;
@@ -138,28 +139,53 @@ def fetch_history(secid: str, days: int = 14):
         value, ratio = max(pairs, key=lambda vr: abs(vr[1]))
         if not ratio:
             continue
-        amount = value / ratio * 100
-        dark = main - retail
-        strength = dark / amount * 100
+        daily.append({"date": p[0], "pct": float(p[12]), "main": main,
+                      "retail": retail, "amount": value / ratio * 100})
+    daily.sort(key=lambda x: x["date"])
+    result = []
+    for i, d in enumerate(daily):
+        window = daily[max(0, i - 4):i + 1]  # 滚动5日窗口
+        amt5 = sum(w["amount"] for w in window)
+        s5 = sum(w["main"] for w in window) / amt5 * 100 if amt5 else None
+        dark = d["main"] - d["retail"]
+        strength = dark / d["amount"] * 100
         result.append({
-            "日期": date,
-            "涨幅(%)": float(pct_s),
-            "成交额(亿)": round(amount / 1e8, 2),
-            "主力资金(亿)": round(main / 1e8, 2),
-            "散户资金(亿)": round(retail / 1e8, 2),
+            "日期": d["date"],
+            "涨幅(%)": d["pct"],
+            "成交额(亿)": round(d["amount"] / 1e8, 2),
+            "主力资金(亿)": round(d["main"] / 1e8, 2),
+            "散户资金(亿)": round(d["retail"] / 1e8, 2),
             "主力暗盘(亿)": round(dark / 1e8, 2),
             "主力强度": round(strength, 2),
-            "主力行为": classify(strength),
+            "5日主力占比": round(s5, 2) if s5 is not None else "",
+            "主力行为": classify(strength, d["pct"], d["retail"], s5),
         })
     result.sort(key=lambda x: x["日期"], reverse=True)
-    return result
+    return result[:days]
 
 
 HIST_COLUMNS = ["日期", "涨幅(%)", "成交额(亿)", "主力资金(亿)",
-                "散户资金(亿)", "主力暗盘(亿)", "主力强度", "主力行为"]
+                "散户资金(亿)", "主力暗盘(亿)", "主力强度",
+                "5日主力占比", "主力行为"]
 
 
-def classify(strength: float) -> str:
+def classify(strength, pct=None, retail=None, s5=None):
+    """多日复合判别主力行为(资金方向 × 价格表现 × 散户方向)。
+
+    strength: 当日主力强度; pct: 当日涨幅%; retail: 散户资金(元, 取方向);
+    s5: 近5日主力净占比%(无多日数据时为 None, 退化为单日判别)。
+    """
+    if pct is not None:
+        if strength >= 3 and pct > 0:
+            return "抢筹"
+        if strength <= -1 and ((retail or 0) > 0
+                               or (s5 is not None and s5 <= -1)):
+            return "出货"
+        if s5 is not None and s5 >= 1 and strength > -1:
+            return "建仓"
+        if abs(strength) < 1 and pct <= 0 and (retail or 0) <= 0:
+            return "洗盘"
+    # 兑底: 按单日强度
     if strength >= 3:
         return "抢筹"
     if strength >= 1:
@@ -184,17 +210,25 @@ def compute(rows, pinned=False):
         retail = small               # 散户资金(仅小单)
         dark = main - retail         # 主力暗盘
         strength = dark / amount * 100
+        pct5 = r.get("f109")         # 5日涨跌幅 %
+        s5 = r.get("f165")           # 5日主力净占比 %
+        if not isinstance(s5, (int, float)):
+            s5 = None
         result.append({
             "_secid": f"{r.get('f13', 90)}.{r.get('f12')}",
             "_pinned": pinned,
             "板块": name,
             "涨幅(%)": pct,
+            "5日涨幅(%)": pct5 if isinstance(pct5, (int, float)) else "",
             "成交额(亿)": round(amount / 1e8, 2),
             "主力资金(亿)": round(main / 1e8, 2),
             "散户资金(亿)": round(retail / 1e8, 2),
             "主力暗盘(亿)": round(dark / 1e8, 2),
             "主力强度": round(strength, 2),
-            "主力行为": classify(strength),
+            "5日主力占比": s5 if s5 is not None else "",
+            "主力行为": classify(
+                strength, pct if isinstance(pct, (int, float)) else None,
+                retail, s5),
         })
     if not pinned:
         # 按市场热度(成交额)降序
@@ -202,8 +236,9 @@ def compute(rows, pinned=False):
     return result
 
 
-COLUMNS = ["板块", "涨幅(%)", "成交额(亿)", "主力资金(亿)",
-           "散户资金(亿)", "主力暗盘(亿)", "主力强度", "主力行为"]
+COLUMNS = ["板块", "涨幅(%)", "5日涨幅(%)", "成交额(亿)", "主力资金(亿)",
+           "散户资金(亿)", "主力暗盘(亿)", "主力强度",
+           "5日主力占比", "主力行为"]
 
 
 def print_table(rows, limit=None):
@@ -240,11 +275,13 @@ def save_html(rows, path, kind, date_str):
         tds = [
             f"<td>{r['板块']}</td>",
             f"<td style='color:{pct_color}'>{pct}</td>",
+            f"<td>{r['5日涨幅(%)']}</td>",
             f"<td>{r['成交额(亿)']}</td>",
             f"<td>{r['主力资金(亿)']}</td>",
             f"<td>{r['散户资金(亿)']}</td>",
             f"<td>{r['主力暗盘(亿)']}</td>",
             f"<td>{r['主力强度']}</td>",
+            f"<td>{r['5日主力占比']}</td>",
             f"<td style='color:{behavior_color[r['主力行为']]};font-weight:bold'>{r['主力行为']}</td>",
         ]
         trs.append("<tr>" + "".join(tds) + "</tr>")
@@ -259,9 +296,10 @@ th{{background:#f5f5f5}}
 td:first-child,th:first-child{{text-align:left}}
 tr:hover{{background:#fafafa}}
 </style></head><body>
-<h2>{date_str} {kind_name}主力行为 (按主力强度降序)</h2>
+<h2>{date_str} {kind_name}主力行为 (指数置顶, 其余按成交额降序)</h2>
 <p>主力暗盘=主力资金-散户资金; 主力强度=主力暗盘/成交额×100;
-行为: ≥3 抢筹, [1,3) 建仓, (-1,1) 洗盘, ≤-1 出货</p>
+行为为多日复合判别: 抢筹=当日强力流入且上涨; 出货=主力撤离且散户接盘/多日流出;
+建仓=5日持续吸筹; 洗盘=资金平衡+回调+散户离场</p>
 <table><thead><tr>{"".join(f"<th>{c}</th>" for c in COLUMNS)}</tr></thead>
 <tbody>{"".join(trs)}</tbody></table>
 </body></html>"""
