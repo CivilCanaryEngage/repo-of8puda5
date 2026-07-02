@@ -16,15 +16,16 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from main_force import (COLUMNS, HIST_COLUMNS, compute, fetch_history,
-                        fetch_indices, fetch_sectors, save_csv,
-                        search_security)
+from main_force import (COLUMNS, HIST_COLUMNS, compute, detect_movers,
+                        fetch_history_full, fetch_indices, fetch_sectors,
+                        save_csv, search_security)
 
 KIND_NAMES = {"industry": "行业板块", "concept": "概念板块", "region": "地域板块"}
 BEHAVIOR_COLORS = {"抢筹": "#d32f2f", "建仓": "#f57c00",
                    "洗盘": "#616161", "出货": "#2e7d32"}
 PINNED_BG = "#eef3fb"
 STRIPE_BG = "#f7f7f7"
+ALERT_BG = "#fdecec"  # 行为刚切换为抢筹的行
 AUTO_REFRESH_TIME = datetime.time(15, 30)  # 北京时间收盘后
 
 
@@ -43,6 +44,8 @@ def _fill_tree(tree, columns, rows, iid_map=None, pinned_key=None):
         tags = [r["主力行为"]]
         if pinned_key and r.get(pinned_key):
             tags.append("pinned")
+        elif r.get("_alert"):
+            tags.append("alert")
         elif i % 2:
             tags.append("stripe")
         iid = tree.insert("", "end", values=[r.get(c, "") for c in columns],
@@ -74,6 +77,7 @@ def _make_tree(parent, columns, heading_cmd=None):
         tree.tag_configure(behavior, foreground=color)
     tree.tag_configure("pinned", background=PINNED_BG)
     tree.tag_configure("stripe", background=STRIPE_BG)
+    tree.tag_configure("alert", background=ALERT_BG)
     return tree
 
 
@@ -84,6 +88,7 @@ class App(tk.Tk):
         self.geometry("1180x680")
         ttk.Style(self).theme_use("clam")
         self.rows = []
+        self._last_behavior = {}  # 上次刷新的 {板块: 行为}, 用于变化提醒
         self._build_ui()
         self._schedule_auto_refresh()
         self.refresh()
@@ -110,6 +115,8 @@ class App(tk.Tk):
 
         self.refresh_btn = ttk.Button(top, text="刷新(F5)", command=self.refresh)
         self.refresh_btn.pack(side="left")
+        ttk.Button(top, text="主力异动榜", command=self.show_movers).pack(
+            side="left", padx=(8, 0))
         ttk.Button(top, text="导出CSV", command=self.export_csv).pack(
             side="left", padx=8)
 
@@ -166,9 +173,34 @@ class App(tk.Tk):
             messagebox.showerror("错误", f"获取数据失败: {error}")
             return
         self.rows = rows
+        alerts = self._mark_behavior_changes(rows)
         now = datetime.datetime.now().strftime("%H:%M:%S")
-        self.status_var.set(f"共 {len(rows)} 个板块 | 更新于 {now}")
+        status = f"共 {len(rows)} 个板块 | 更新于 {now}"
+        if alerts:
+            names = "、".join(alerts[:5]) + ("等" if len(alerts) > 5 else "")
+            status += f" | ⚡ {len(alerts)} 个板块转为抢筹: {names}"
+            self.bell()
+        self.status_var.set(status)
         self._render()
+
+    def _mark_behavior_changes(self, rows):
+        """标记本次刷新中行为切换为抢筹的板块(红底高亮)。"""
+        alerts = []
+        for r in rows:
+            prev = self._last_behavior.get(r["板块"])
+            if (not r.get("_pinned") and prev
+                    and prev != "抢筹" and r["主力行为"] == "抢筹"):
+                r["_alert"] = True
+                alerts.append(r["板块"])
+        self._last_behavior = {r["板块"]: r["主力行为"] for r in rows}
+        return alerts
+
+    def show_movers(self):
+        """主力异动榜: 多日建仓后当日转抢筹的板块。"""
+        if not self.rows:
+            messagebox.showinfo("提示", "暂无数据, 请先刷新")
+            return
+        MoversWindow(self, detect_movers(self.rows))
 
     def _render(self):
         behavior = self.filter_var.get()
@@ -282,6 +314,29 @@ class App(tk.Tk):
         self._schedule_auto_refresh()
 
 
+class MoversWindow(tk.Toplevel):
+    """主力异动榜: 当日抢筹且近5日主力占比>=1(前期持续吸筹)。"""
+
+    def __init__(self, master, movers):
+        super().__init__(master)
+        self.title("主力异动榜")
+        self.geometry("1080x420")
+        ttk.Label(
+            self, padding=8,
+            text=f"共 {len(movers)} 个板块: 前期多日持续吸筹(5日主力占比≥1) "
+                 "且当日放量抢筹 —— 典型启动信号, 按当日强度降序; 双击查看历史"
+        ).pack(fill="x")
+        self.tree = _make_tree(self, COLUMNS)
+        self._iid_map = {}
+        _fill_tree(self.tree, COLUMNS, movers, iid_map=self._iid_map)
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+    def _on_double_click(self, event):
+        row = self._iid_map.get(self.tree.identify_row(event.y))
+        if row:
+            HistoryWindow(self, row["_secid"], row["板块"])
+
+
 class HistoryWindow(tk.Toplevel):
     """近 N 天主力行为历史窗口, 支持近7天/近14天切换。"""
 
@@ -309,18 +364,19 @@ class HistoryWindow(tk.Toplevel):
 
     def _work(self):
         try:
-            rows = fetch_history(self.secid, days=14)
-            self.after(0, self._on_data, rows, None)
+            rows, degraded = fetch_history_full(self.secid, days=14)
+            self.after(0, self._on_data, rows, degraded, None)
         except Exception as e:
-            self.after(0, self._on_data, [], e)
+            self.after(0, self._on_data, [], False, e)
 
-    def _on_data(self, rows, error):
+    def _on_data(self, rows, degraded, error):
         if not self.winfo_exists():
             return
         if error:
             self.status.set(f"加载失败: {error}")
             return
         self.all_rows = rows
+        self.degraded = degraded
         self._render()
 
     def _render(self):
@@ -330,8 +386,10 @@ class HistoryWindow(tk.Toplevel):
         _fill_tree(self.tree, HIST_COLUMNS, rows)
         main_sum = sum(r["主力资金(亿)"] for r in rows)
         dark_sum = sum(r["主力暗盘(亿)"] for r in rows)
+        prefix = ("⚠ 接口限流, 仅当日数据, 稍后重新打开可取完整历史 | "
+                  if getattr(self, "degraded", False) else "")
         self.status.set(
-            f"{self.name} | 近 {len(rows)} 个交易日 | "
+            f"{prefix}{self.name} | 近 {len(rows)} 个交易日 | "
             f"累计主力净流入 {main_sum:.2f}亿, 累计暗盘 {dark_sum:.2f}亿")
 
 

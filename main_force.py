@@ -75,7 +75,7 @@ def _get_json(url, retries=3):
         except Exception:
             if attempt == retries - 1:
                 raise
-            time.sleep(1)
+            time.sleep(1 + attempt * 2)  # 递增退避, 缓解接口限流
 
 
 def fetch_sectors(kind: str = "industry"):
@@ -110,18 +110,31 @@ def search_security(query: str):
             for it in items if it.get("Classify") in ("AStock", "BK")]
 
 
-def fetch_history(secid: str, days: int = 14):
-    """获取近 N 个交易日的资金流历史, secid 如 90.BK0478 / 1.600519。
+# 历史数据本地缓存: push2his 对频繁请求限流,
+# 同一标的短时间内重复查看直接命中缓存, 不再请求接口
+HIST_CACHE_TTL = 600  # 秒
+_hist_cache = {}
 
-    返回按日期降序的字典列表, 字段同 HIST_COLUMNS。
+
+def fetch_history_full(secid: str, days: int = 14):
+    """获取近 N 个交易日的资金流历史, 返回 (rows, degraded)。
+
+    rows: 按日期降序的字典列表, 字段同 HIST_COLUMNS;
+    degraded: True 表示历史接口被限流, 降级为仅当日数据。
     为了计算每日的"5日主力占比", 实际多拉取 4 日作为滚动窗口。
+    完整结果缓存 HIST_CACHE_TTL 秒, 降级结果不缓存以便稍后重试。
     """
-    fflow = None
+    cached = _hist_cache.get(secid)
+    if cached and time.time() - cached[0] < HIST_CACHE_TTL \
+            and len(cached[1]) >= min(days, len(cached[1])) and cached[1]:
+        return cached[1][:days], False
+    fflow, degraded = None, False
     for host in HIST_FFLOW_HOSTS:
         try:
             fflow = _get_json(
                 HIST_FFLOW_API.format(host=host, secid=secid, days=days + 4),
-                retries=2)
+                retries=3)
+            degraded = host != HIST_FFLOW_HOSTS[0]
             break
         except Exception:
             if host == HIST_FFLOW_HOSTS[-1]:
@@ -161,7 +174,16 @@ def fetch_history(secid: str, days: int = 14):
             "主力行为": classify(strength, d["pct"], d["retail"], s5),
         })
     result.sort(key=lambda x: x["日期"], reverse=True)
-    return result[:days]
+    if len(result) <= 1 < days:
+        degraded = True  # 历史接口只给了当日数据, 视为降级
+    if not degraded and result:
+        _hist_cache[secid] = (time.time(), result)
+    return result[:days], degraded
+
+
+def fetch_history(secid: str, days: int = 14):
+    """兼容接口: 只返回 rows。"""
+    return fetch_history_full(secid, days)[0]
 
 
 HIST_COLUMNS = ["日期", "涨幅(%)", "成交额(亿)", "主力资金(亿)",
@@ -239,6 +261,20 @@ def compute(rows, pinned=False):
 COLUMNS = ["板块", "涨幅(%)", "5日涨幅(%)", "成交额(亿)", "主力资金(亿)",
            "散户资金(亿)", "主力暗盘(亿)", "主力强度",
            "5日主力占比", "主力行为"]
+
+
+def detect_movers(rows):
+    """主力异动榜: 多日持续吸筹(5日占比>=1)后当日转为抢筹的标的。
+
+    这是最典型的启动信号: 前期低调建仓, 当日放量上攻。
+    返回按当日主力强度降序的子集。
+    """
+    movers = [r for r in rows
+              if not r.get("_pinned") and r["主力行为"] == "抢筹"
+              and isinstance(r["5日主力占比"], (int, float))
+              and r["5日主力占比"] >= 1]
+    movers.sort(key=lambda r: r["主力强度"], reverse=True)
+    return movers
 
 
 def print_table(rows, limit=None):
