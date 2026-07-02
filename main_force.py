@@ -3,6 +3,10 @@
 """A股板块主力行为计算工具
 
 数据来源: 东方财富板块资金流接口(免费公开)
+口径:
+    主力资金 = 超大单+大单净流入(机构/大户)
+    散户资金 = 小单净流入(中单视为中户/游资, 不计入散户,
+               避免资金流零和导致散户恒等于-主力)
 公式:
     主力暗盘 = 主力资金 - 散户资金
     主力强度 = 主力暗盘 / 成交额 * 100
@@ -127,7 +131,7 @@ def fetch_history(secid: str, days: int = 14):
         p = line.split(",")
         date, pct_s = p[0], p[12]
         main = float(p[1])
-        retail = float(p[2]) + float(p[3])
+        retail = float(p[2])  # 散户资金(仅小单)
         # 接口不直接返回成交额, 由 净额/净占比×100 反推;
         # 取净占比绝对值最大的一类单(主力/小/中/大/超大)以降低舍入误差
         pairs = [(float(p[i]), float(p[i + 5])) for i in range(1, 6)]
@@ -172,13 +176,12 @@ def compute(rows, pinned=False):
         pct = r.get("f3")            # 涨幅 %
         amount = r.get("f6")         # 成交额 元
         main = r.get("f62")          # 主力资金净流入(超大单+大单) 元
-        mid = r.get("f78") or 0      # 中单净流入
         small = r.get("f84") or 0    # 小单净流入
         if not isinstance(amount, (int, float)) or not amount:
             continue
         if not isinstance(main, (int, float)):
             continue
-        retail = mid + small         # 散户资金
+        retail = small               # 散户资金(仅小单)
         dark = main - retail         # 主力暗盘
         strength = dark / amount * 100
         result.append({
