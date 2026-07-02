@@ -25,7 +25,16 @@ import urllib.request
 API = (
     "https://push2delay.eastmoney.com/api/qt/clist/get"
     "?pn={page}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f62&fs={fs}"
-    "&fields=f12,f14,f3,f6,f62,f66,f72,f78,f84"
+    "&fields=f12,f13,f14,f3,f6,f62,f66,f72,f78,f84"
+)
+
+# 固定置顶的大盘指数: 上证指数 / 创业板指 / 科创50
+INDEX_SECIDS = "1.000001,0.399006,1.000688"
+
+INDEX_API = (
+    "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
+    "?fltt=2&invt=2&secids={secids}"
+    "&fields=f12,f13,f14,f3,f6,f62,f66,f72,f78,f84"
 )
 
 # fs 参数: 行业板块 m:90+t:2, 概念板块 m:90+t:3, 地域板块 m:90+t:1
@@ -80,6 +89,11 @@ def fetch_sectors(kind: str = "industry"):
         rows.extend(diff)
         page += 1
     return rows
+
+
+def fetch_indices():
+    data = _get_json(INDEX_API.format(secids=INDEX_SECIDS))
+    return ((data.get("data") or {}).get("diff")) or []
 
 
 def search_security(query: str):
@@ -151,7 +165,7 @@ def classify(strength: float) -> str:
     return "出货"
 
 
-def compute(rows):
+def compute(rows, pinned=False):
     result = []
     for r in rows:
         name = r.get("f14")
@@ -168,7 +182,8 @@ def compute(rows):
         dark = main - retail         # 主力暗盘
         strength = dark / amount * 100
         result.append({
-            "_secid": f"90.{r.get('f12')}",
+            "_secid": f"{r.get('f13', 90)}.{r.get('f12')}",
+            "_pinned": pinned,
             "板块": name,
             "涨幅(%)": pct,
             "成交额(亿)": round(amount / 1e8, 2),
@@ -178,7 +193,9 @@ def compute(rows):
             "主力强度": round(strength, 2),
             "主力行为": classify(strength),
         })
-    result.sort(key=lambda x: x["主力强度"], reverse=True)
+    if not pinned:
+        # 按市场热度(成交额)降序
+        result.sort(key=lambda x: x["成交额(亿)"], reverse=True)
     return result
 
 
@@ -259,7 +276,8 @@ def main():
     args = parser.parse_args()
 
     date_str = datetime.date.today().isoformat()
-    rows = compute(fetch_sectors(args.kind))
+    rows = compute(fetch_indices(), pinned=True) + compute(
+        fetch_sectors(args.kind))
     if not rows:
         raise SystemExit("未获取到数据，请检查网络或接口。")
 
