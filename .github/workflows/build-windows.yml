@@ -1,0 +1,27 @@
+name: Build Windows Client
+
+on:
+  push:
+    branches: [main]
+    paths: ["gui.py", "main_force.py", ".github/workflows/build-windows.yml"]
+  pull_request:
+    paths: ["gui.py", "main_force.py", ".github/workflows/build-windows.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller==6.14.1
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name "A股主力行为" gui.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: A股主力行为-windows
+          path: dist/*.exe
