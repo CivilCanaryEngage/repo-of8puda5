@@ -13,8 +13,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from main_force import (COLUMNS, HIST_COLUMNS, SECTOR_FS, compute,
-                        fetch_history, fetch_sectors, save_csv,
-                        search_security)
+                        fetch_history, fetch_indices, fetch_sectors,
+                        save_csv, search_security)
 
 KIND_NAMES = {"industry": "行业板块", "concept": "概念板块", "region": "地域板块"}
 BEHAVIOR_COLORS = {"抢筹": "#d32f2f", "建仓": "#f57c00",
@@ -90,9 +90,10 @@ class App(tk.Tk):
         vsb.pack(side="right", fill="y")
         for behavior, color in BEHAVIOR_COLORS.items():
             self.tree.tag_configure(behavior, foreground=color)
+        self.tree.tag_configure("pinned", background="#eef3fb")
         self.tree.bind("<Double-1>", self._on_double_click)
 
-        self._sort_col = "主力强度"
+        self._sort_col = "成交额(亿)"  # 市场热度
         self._sort_desc = True
 
     def _kind(self):
@@ -107,7 +108,8 @@ class App(tk.Tk):
 
     def _fetch(self, kind):
         try:
-            rows = compute(fetch_sectors(kind))
+            rows = (compute(fetch_indices(), pinned=True)
+                    + compute(fetch_sectors(kind)))
             self.after(0, self._on_data, rows, None)
         except Exception as e:
             self.after(0, self._on_data, [], e)
@@ -126,8 +128,9 @@ class App(tk.Tk):
     def _render(self):
         self.tree.delete(*self.tree.get_children())
         behavior = self.filter_var.get()
-        rows = [r for r in self.rows
-                if behavior == "全部" or r["主力行为"] == behavior]
+        pinned = [r for r in self.rows if r.get("_pinned")]
+        rows = [r for r in self.rows if not r.get("_pinned")
+                and (behavior == "全部" or r["主力行为"] == behavior)]
         rows.sort(key=lambda r: (r[self._sort_col]
                                  if isinstance(r[self._sort_col], (int, float))
                                  else 0),
@@ -135,9 +138,11 @@ class App(tk.Tk):
         if self._sort_col == "板块":
             rows.sort(key=lambda r: str(r["板块"]), reverse=self._sort_desc)
         self._iid_map = {}
-        for r in rows:
+        for r in pinned + rows:
+            tags = (r["主力行为"], "pinned") if r.get("_pinned") \
+                else (r["主力行为"],)
             iid = self.tree.insert("", "end", values=[r[c] for c in COLUMNS],
-                                   tags=(r["主力行为"],))
+                                   tags=tags)
             self._iid_map[iid] = r
 
     def _sort_by(self, col):
