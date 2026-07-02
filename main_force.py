@@ -18,6 +18,8 @@ import csv
 import datetime
 import json
 import os
+import time
+import urllib.parse
 import urllib.request
 
 API = (
@@ -34,6 +36,32 @@ SECTOR_FS = {
 }
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# push2his 提供历史数据; push2delay 仅返回当日, 作为降级备选
+HIST_FFLOW_HOSTS = ["push2his.eastmoney.com", "push2delay.eastmoney.com"]
+
+HIST_FFLOW_API = (
+    "https://{host}/api/qt/stock/fflow/daykline/get"
+    "?lmt={days}&klt=101&secid={secid}&fields1=f1,f2,f3,f7"
+    "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
+)
+
+SUGGEST_API = (
+    "https://searchapi.eastmoney.com/api/suggest/get"
+    "?input={query}&type=14&count=10"
+)
+
+
+def _get_json(url, retries=3):
+    req = urllib.request.Request(url, headers=HEADERS)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(1)
 
 
 def fetch_sectors(kind: str = "industry"):
@@ -52,6 +80,65 @@ def fetch_sectors(kind: str = "industry"):
         rows.extend(diff)
         page += 1
     return rows
+
+
+def search_security(query: str):
+    """搜索个股/板块(支持代码/中文/拼音)，返回 [(secid, 代码, 名称), ...]"""
+    url = SUGGEST_API.format(query=urllib.parse.quote(query))
+    data = _get_json(url)
+    items = ((data.get("QuotationCodeTable") or {}).get("Data")) or []
+    return [(it["QuoteID"], it["Code"], it["Name"])
+            for it in items if it.get("Classify") in ("AStock", "BK")]
+
+
+def fetch_history(secid: str, days: int = 14):
+    """获取近 N 个交易日的资金流历史, secid 如 90.BK0478 / 1.600519。
+
+    返回按日期降序的字典列表, 字段同 COLUMNS(首列为日期)。
+    """
+    fflow = None
+    for host in HIST_FFLOW_HOSTS:
+        try:
+            fflow = _get_json(
+                HIST_FFLOW_API.format(host=host, secid=secid, days=days),
+                retries=2)
+            break
+        except Exception:
+            if host == HIST_FFLOW_HOSTS[-1]:
+                raise
+    result = []
+    for line in ((fflow.get("data") or {}).get("klines")) or []:
+        # f51日期, f52主力, f53小单, f54中单, f55大单, f56超大单,
+        # f57~f61对应各类单净占比(%), f62收盘价, f63涨跌幅(%)
+        p = line.split(",")
+        date, pct_s = p[0], p[12]
+        main = float(p[1])
+        retail = float(p[2]) + float(p[3])
+        # 接口不直接返回成交额, 由 净额/净占比×100 反推;
+        # 取净占比绝对值最大的一类单(主力/小/中/大/超大)以降低舍入误差
+        pairs = [(float(p[i]), float(p[i + 5])) for i in range(1, 6)]
+        value, ratio = max(pairs, key=lambda vr: abs(vr[1]))
+        if not ratio:
+            continue
+        amount = value / ratio * 100
+        dark = main - retail
+        strength = dark / amount * 100
+        result.append({
+            "日期": date,
+            "涨幅(%)": float(pct_s),
+            "成交额(亿)": round(amount / 1e8, 2),
+            "主力资金(亿)": round(main / 1e8, 2),
+            "散户资金(亿)": round(retail / 1e8, 2),
+            "主力暗盘(亿)": round(dark / 1e8, 2),
+            "主力强度": round(strength, 2),
+            "主力行为": classify(strength),
+        })
+    result.sort(key=lambda x: x["日期"], reverse=True)
+    return result
+
+
+HIST_COLUMNS = ["日期", "涨幅(%)", "成交额(亿)", "主力资金(亿)",
+                "散户资金(亿)", "主力暗盘(亿)", "主力强度", "主力行为"]
 
 
 def classify(strength: float) -> str:
@@ -81,6 +168,7 @@ def compute(rows):
         dark = main - retail         # 主力暗盘
         strength = dark / amount * 100
         result.append({
+            "_secid": f"90.{r.get('f12')}",
             "板块": name,
             "涨幅(%)": pct,
             "成交额(亿)": round(amount / 1e8, 2),
@@ -115,7 +203,7 @@ def print_table(rows, limit=None):
 
 def save_csv(rows, path):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 

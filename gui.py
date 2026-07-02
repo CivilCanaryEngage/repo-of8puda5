@@ -4,6 +4,7 @@
 
 展示字段: 板块, 涨幅, 成交额, 主力资金, 散户资金, 主力暗盘, 主力强度, 主力行为
 支持行业/概念/地域板块切换、手动刷新、每日收盘后(15:30)自动刷新、导出CSV。
+双击板块查看近2周历史；搜索框支持个股/板块，代码和中文名均可。
 """
 
 import datetime
@@ -11,7 +12,9 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from main_force import COLUMNS, SECTOR_FS, compute, fetch_sectors, save_csv
+from main_force import (COLUMNS, HIST_COLUMNS, SECTOR_FS, compute,
+                        fetch_history, fetch_sectors, save_csv,
+                        search_security)
 
 KIND_NAMES = {"industry": "行业板块", "concept": "概念板块", "region": "地域板块"}
 BEHAVIOR_COLORS = {"抢筹": "#d32f2f", "建仓": "#f57c00",
@@ -54,6 +57,13 @@ class App(tk.Tk):
         ttk.Button(top, text="导出CSV", command=self.export_csv).pack(
             side="left", padx=8)
 
+        ttk.Label(top, text="个股/板块查询:").pack(side="left", padx=(12, 0))
+        self.stock_var = tk.StringVar()
+        stock_entry = ttk.Entry(top, textvariable=self.stock_var, width=14)
+        stock_entry.pack(side="left", padx=4)
+        stock_entry.bind("<Return>", lambda e: self.query_stock())
+        ttk.Button(top, text="查询", command=self.query_stock).pack(side="left")
+
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(top, textvariable=self.status_var).pack(side="right")
 
@@ -61,7 +71,7 @@ class App(tk.Tk):
             self, padding=(8, 0),
             text="主力暗盘=主力资金-散户资金; 主力强度=主力暗盘/成交额×100; "
                  "行为: ≥3 抢筹, [1,3) 建仓, (-1,1) 洗盘, ≤-1 出货; "
-                 "每日15:30自动刷新")
+                 "每日15:30自动刷新; 双击板块查看近2周数据")
         info.pack(fill="x")
 
         frame = ttk.Frame(self, padding=8)
@@ -80,6 +90,7 @@ class App(tk.Tk):
         vsb.pack(side="right", fill="y")
         for behavior, color in BEHAVIOR_COLORS.items():
             self.tree.tag_configure(behavior, foreground=color)
+        self.tree.bind("<Double-1>", self._on_double_click)
 
         self._sort_col = "主力强度"
         self._sort_desc = True
@@ -123,9 +134,11 @@ class App(tk.Tk):
                   reverse=self._sort_desc)
         if self._sort_col == "板块":
             rows.sort(key=lambda r: str(r["板块"]), reverse=self._sort_desc)
+        self._iid_map = {}
         for r in rows:
-            self.tree.insert("", "end", values=[r[c] for c in COLUMNS],
-                             tags=(r["主力行为"],))
+            iid = self.tree.insert("", "end", values=[r[c] for c in COLUMNS],
+                                   tags=(r["主力行为"],))
+            self._iid_map[iid] = r
 
     def _sort_by(self, col):
         if self._sort_col == col:
@@ -146,6 +159,77 @@ class App(tk.Tk):
         if path:
             save_csv(self.rows, path)
             messagebox.showinfo("提示", f"已导出: {path}")
+
+    def _on_double_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        row = getattr(self, "_iid_map", {}).get(iid)
+        if row:
+            self._open_history(row["_secid"], row["板块"])
+
+    def query_stock(self):
+        query = self.stock_var.get().strip()
+        if not query:
+            return
+        self.status_var.set("搜索中...")
+
+        def work():
+            try:
+                matches = search_security(query)
+                self.after(0, on_result, matches, None)
+            except Exception as e:
+                self.after(0, on_result, [], e)
+
+        def on_result(matches, error):
+            self.status_var.set("就绪")
+            if error:
+                messagebox.showerror("错误", f"搜索失败: {error}")
+            elif not matches:
+                messagebox.showinfo("提示", f"未找到个股或板块: {query}")
+            else:
+                secid, code, name = matches[0]
+                self._open_history(secid, f"{name}({code})")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_history(self, secid, title):
+        win = tk.Toplevel(self)
+        win.title(f"{title} - 近2周主力行为")
+        win.geometry("860x420")
+        status = tk.StringVar(value="加载中...")
+        ttk.Label(win, textvariable=status, padding=8).pack(fill="x")
+        frame = ttk.Frame(win, padding=8)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=HIST_COLUMNS, show="headings")
+        for col in HIST_COLUMNS:
+            tree.heading(col, text=col)
+            tree.column(col, width=100 if col == "日期" else 90,
+                        anchor="w" if col == "日期" else "e")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        for behavior, color in BEHAVIOR_COLORS.items():
+            tree.tag_configure(behavior, foreground=color)
+
+        def work():
+            try:
+                rows = fetch_history(secid)
+                win.after(0, on_data, rows, None)
+            except Exception as e:
+                win.after(0, on_data, [], e)
+
+        def on_data(rows, error):
+            if not win.winfo_exists():
+                return
+            if error:
+                status.set(f"加载失败: {error}")
+                return
+            status.set(f"{title} | 近 {len(rows)} 个交易日 (日期降序)")
+            for r in rows:
+                tree.insert("", "end", values=[r[c] for c in HIST_COLUMNS],
+                            tags=(r["主力行为"],))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _schedule_auto_refresh(self):
         now = datetime.datetime.now()
