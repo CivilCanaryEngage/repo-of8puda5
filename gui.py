@@ -4,7 +4,7 @@
 
 展示字段: 板块, 涨幅, 成交额, 主力资金, 散户资金, 主力暗盘, 主力强度, 主力行为
 支持行业/概念/地域板块切换、手动刷新、每日收盘后(15:30)自动刷新、导出CSV。
-双击板块查看近2周历史；个股查询支持代码和中文名。
+双击板块查看近2周历史；搜索框支持个股/板块，代码和中文名均可。
 """
 
 import datetime
@@ -13,7 +13,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from main_force import (COLUMNS, HIST_COLUMNS, SECTOR_FS, compute,
-                        fetch_history, fetch_sectors, save_csv, search_stock)
+                        fetch_history, fetch_sectors, save_csv,
+                        search_security)
 
 KIND_NAMES = {"industry": "行业板块", "concept": "概念板块", "region": "地域板块"}
 BEHAVIOR_COLORS = {"抢筹": "#d32f2f", "建仓": "#f57c00",
@@ -56,7 +57,7 @@ class App(tk.Tk):
         ttk.Button(top, text="导出CSV", command=self.export_csv).pack(
             side="left", padx=8)
 
-        ttk.Label(top, text="个股查询:").pack(side="left", padx=(12, 0))
+        ttk.Label(top, text="个股/板块查询:").pack(side="left", padx=(12, 0))
         self.stock_var = tk.StringVar()
         stock_entry = ttk.Entry(top, textvariable=self.stock_var, width=14)
         stock_entry.pack(side="left", padx=4)
@@ -173,7 +174,7 @@ class App(tk.Tk):
 
         def work():
             try:
-                matches = search_stock(query)
+                matches = search_security(query)
                 self.after(0, on_result, matches, None)
             except Exception as e:
                 self.after(0, on_result, [], e)
@@ -183,7 +184,7 @@ class App(tk.Tk):
             if error:
                 messagebox.showerror("错误", f"搜索失败: {error}")
             elif not matches:
-                messagebox.showinfo("提示", f"未找到个股: {query}")
+                messagebox.showinfo("提示", f"未找到个股或板块: {query}")
             else:
                 secid, code, name = matches[0]
                 self._open_history(secid, f"{name}({code})")

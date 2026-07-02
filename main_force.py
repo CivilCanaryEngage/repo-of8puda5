@@ -43,7 +43,7 @@ HIST_FFLOW_HOSTS = ["push2his.eastmoney.com", "push2delay.eastmoney.com"]
 HIST_FFLOW_API = (
     "https://{host}/api/qt/stock/fflow/daykline/get"
     "?lmt={days}&klt=101&secid={secid}&fields1=f1,f2,f3,f7"
-    "&fields2=f51,f52,f53,f54,f55,f56,f57,f62,f63"
+    "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
 )
 
 SUGGEST_API = (
@@ -82,13 +82,13 @@ def fetch_sectors(kind: str = "industry"):
     return rows
 
 
-def search_stock(query: str):
-    """搜索个股(支持代码/中文/拼音)，返回 [(secid, 代码, 名称), ...]"""
+def search_security(query: str):
+    """搜索个股/板块(支持代码/中文/拼音)，返回 [(secid, 代码, 名称), ...]"""
     url = SUGGEST_API.format(query=urllib.parse.quote(query))
     data = _get_json(url)
     items = ((data.get("QuotationCodeTable") or {}).get("Data")) or []
     return [(it["QuoteID"], it["Code"], it["Name"])
-            for it in items if it.get("Classify") == "AStock"]
+            for it in items if it.get("Classify") in ("AStock", "BK")]
 
 
 def fetch_history(secid: str, days: int = 14):
@@ -109,16 +109,18 @@ def fetch_history(secid: str, days: int = 14):
     result = []
     for line in ((fflow.get("data") or {}).get("klines")) or []:
         # f51日期, f52主力, f53小单, f54中单, f55大单, f56超大单,
-        # f57主力净占比(%), f62收盘价, f63涨跌幅(%)
+        # f57~f61对应各类单净占比(%), f62收盘价, f63涨跌幅(%)
         p = line.split(",")
-        date, pct_s = p[0], p[8]
+        date, pct_s = p[0], p[12]
         main = float(p[1])
         retail = float(p[2]) + float(p[3])
-        main_ratio = float(p[6])
-        if not main_ratio:
+        # 接口不直接返回成交额, 由 净额/净占比×100 反推;
+        # 取净占比绝对值最大的一类单(主力/小/中/大/超大)以降低舍入误差
+        pairs = [(float(p[i]), float(p[i + 5])) for i in range(1, 6)]
+        value, ratio = max(pairs, key=lambda vr: abs(vr[1]))
+        if not ratio:
             continue
-        # 成交额由主力净额与主力净占比反推
-        amount = main / main_ratio * 100
+        amount = value / ratio * 100
         dark = main - retail
         strength = dark / amount * 100
         result.append({
